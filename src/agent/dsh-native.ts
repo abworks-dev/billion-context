@@ -141,7 +141,7 @@ type CommandOutcome = { kind: "success" | "error"; text: string };
 export type PluginContext = {
     tools: { register: (definition: ToolDefinition) => unknown };
     commands: { register: (command: { name: string; description: string; handler: (invocation?: CommandInvocation) => Promise<CommandOutcome> }) => unknown };
-    agents: { currentInitiator?: () => AgentLike | undefined };
+    agents: { currentInitiator?: () => AgentLike | undefined; get?: (id: string) => AgentLike | undefined };
     // Runtime-info sources (#955), resolved via dynamic ctx.inject when the
     // host exposes them (both are core dsh services; optional so older dsh
     // builds or stripped hosts keep the plugin alive without model info).
@@ -1205,10 +1205,17 @@ const dshForkAdopter = createForkAdopter((line) => {
  *  header.isSeeded === true (set only by dsh's fork seed path): subagent
  *  sessions carry parentSession WITHOUT isSeeded — they run fresh task
  *  contexts, never replay the parent history, and must NOT inherit. */
-function forkChildOf(ctx: PluginContext): { sid: string; parent: string } | undefined {
+export function forkChildOf(ctx: PluginContext): { sid: string; parent: string } | undefined {
     let session: AgentLike["session"];
     try {
         session = ctx.agents?.currentInitiator?.()?.session;
+        if (session === undefined) {
+            const scopedSid = sessionIdOf(ctx);
+            if (scopedSid !== undefined) {
+                session = ctx.agents?.get?.(scopedSid)?.session;
+                if (session?.id !== scopedSid) return undefined;
+            }
+        }
     } catch {
         return undefined;
     }

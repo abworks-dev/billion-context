@@ -5,9 +5,9 @@
 // claude's own HTTP client against the static baked base URL, and nothing else
 // re-arms it until the next SessionStart hook (which does not re-run mid-session).
 // Mirrors src/zcode/mcp-entry.ts (30 s tick × 3 failures by default — #4006 knobs).
-// No exit handoff is
-// needed: the proxy watches the claude host pid (parent-gone anti-orphan) and
-// the next hook drops dead pins via pid liveness (launcher.ts attach filter).
+// No exit handoff is needed: the proxy watches the claude host pid (parent-gone
+// anti-orphan), and the next hook drops dead pins via pid liveness (launcher.ts
+// attach filter).
 // Logs go through the shared bili.log tee because claude does not surface this
 // child's stderr.
 

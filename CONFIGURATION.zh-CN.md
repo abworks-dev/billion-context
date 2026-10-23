@@ -174,7 +174,7 @@
 | `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | pi/omp 插件的同一调用循环破除器（连续 3 次警告、5 次中止，按字节全同判定）。false 或 env 0 关闭。 |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | 响应流上解码后模型文本的单字符重复破除器（#3260；#3331 审查后由 #3406 第 1 项补上开关）。连续 N 个相同码点即触发——正常文本远低于默认 200，符号循环的模型会撞上。设 N 调整阈值，设 0（或负数）关闭：合法的长同字符输出（代码注释分隔线、ASCII 分隔线）不会再被中途掐断。thinking/reasoning 通道也在该守卫内。 |
 | `watchdog` | object | {} (all defaults) | — | 原生 lane「代理重生看门狗」的节拍（zcode/claude/kimi 每会话 MCP 入口，#4006）。 |
-| `watchdog.intervalMs` | number | 30000（下限 1000） | BILI_WATCHDOG_INTERVAL_MS | lane 看门狗的健康探测间隔；lane 代理被外部杀掉后的最坏恢复窗口 = 间隔 × 失败上限（默认约 90 秒——#4006 实测 64 秒）。低于 1000 的值回退默认（防秒/毫秒笔误）。 |
+| `watchdog.intervalMs` | number | 30000 (floor 1000) | BILI_WATCHDOG_INTERVAL_MS | lane 看门狗的健康探测间隔；lane 代理被外部杀掉后的最坏恢复窗口 = 间隔 × 失败上限（默认约 90 秒——#4006 实测 64 秒）。低于 1000 的值回退默认（防秒/毫秒笔误）。 |
 | `watchdog.failureLimit` | number | 3 | BILI_WATCHDOG_FAILURE_LIMIT | 连续多少次探测失败后看门狗重生代理。 |
 | `persist` | object | {} (all defaults) | — | 会话落盘持久化（XDG state 目录之下）。 |
 | `persist.enabled` | boolean | true | BILI_PERSIST | 会话记录落盘总开关（0/false 关闭）。 |
@@ -1844,7 +1844,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
 | `BILI_WATCHDOG_FAILURE_LIMIT` | `watchdog.failureLimit` | 3 |
-| `BILI_WATCHDOG_INTERVAL_MS` | `watchdog.intervalMs` | 30000（下限 1000） |
+| `BILI_WATCHDOG_INTERVAL_MS` | `watchdog.intervalMs` | 30000 (floor 1000) |
 | `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |

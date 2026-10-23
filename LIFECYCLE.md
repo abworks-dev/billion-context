@@ -194,6 +194,7 @@
 | `BILI_GUARDRAIL_REPETITION` | guardrails.repetition，默认 on——相同调用循环熔断（warn 3 / abort 5） |
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | guardrails.textRunThreshold，默认 200——输出端同字符连击熔断阈值（proxy 进程侧读，#3406 item 1；0 关闭） |
 | `BILI_AUTO_MODE_FORGE` | autoModeForge.enabled，默认 on——auto-mode 分类判定本地 forge，零出账/计费（`=0` 恢复纯透传，留给付真实判定费的用户，#2740 owner 决定） |
+| `BILI_WATCHDOG_INTERVAL_MS` / `BILI_WATCHDOG_FAILURE_LIMIT` | watchdog.intervalMs/failureLimit，默认 30000/3——每会话 lane 代理重生看门狗节拍（zcode/claude/kimi MCP 入口进程读；interval 在 arm 时读一次、failureLimit 每 tick 读；interval <1000 回退默认防秒/毫秒笔误，#4006） |
 
 ## 3. 非环境变量的 BILI_* 标识符（勿与上表混淆）
 

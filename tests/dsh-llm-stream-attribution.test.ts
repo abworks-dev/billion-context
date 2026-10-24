@@ -308,6 +308,11 @@ test("fork discovery resolves only the exact request-scoped seeded child", async
         assert.deepEqual(await discover(), { sid: "child", parent: "parent" });
         handle.ctx.agents.currentInitiator = () => undefined;
         assert.equal(await discover("child"), undefined, "lookup errors fail closed");
+        // Ambient agent present but sessionless (mid-dispose): takes the same
+        // scoped fallback as a missing one, and resolves when found.
+        handle.ctx.agents.get = (sid) => agents.get(sid);
+        handle.ctx.agents.currentInitiator = () => ({});
+        assert.deepEqual(await discover("child"), { sid: "child", parent: "parent" });
         handle.ctx.agents.get = undefined;
         assert.equal(await discover("child"), undefined, "older hosts remain supported");
         handle.ctx.agents.currentInitiator = () => { throw new Error("disposed scope"); };

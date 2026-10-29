@@ -1172,9 +1172,18 @@ function sessionRevisionOf(session: Session): string {
     return revision;
 }
 
-function forkSnapshot(session: Session) {
-    const messages = session.pluginSnapshot;
-    if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
+function forkSourceMessages(session: Session): CoreMessage[] {
+    if (session.pluginSnapshot !== undefined) return session.pluginSnapshot;
+    const capError = "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy";
+    if (session.metadata.publicSnapshotCapped === true) throw new Error(capError);
+    const messages = getStore().forkRawTail(session);
+    if (!messages) throw new Error("raw snapshot unavailable; send a fresh plugin model request");
+    const cap = publicSnapshotCapBytes();
+    if (cap > 0 && Buffer.byteLength(stableJson(messages), "utf8") > cap) throw new Error(capError);
+    return messages;
+}
+
+function forkSnapshot(session: Session, messages = forkSourceMessages(session)) {
     if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
@@ -1217,8 +1226,7 @@ function forkSnapshot(session: Session) {
  *  fallback path — GET snapshot and status polling never pay O(store)
  *  hashing. Drop this (and the fallback) once no v1 client can exist. */
 export function forkParentRevisionLegacy(session: Session): string {
-    const messages = session.pluginSnapshot;
-    if (!messages) throw new Error("raw snapshot unavailable");
+    const messages = forkSourceMessages(session);
     const store = contentStoreOf(session);
     const state = { ...session.state };
     return forkHash({ sessionId: session.id, messages, state, blockContents: Object.fromEntries(session.blockContents), contentStore: store });
@@ -1436,7 +1444,9 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             if (await replay()) return;
             if (conversations.has(request.childConversationId) || pendingRegisters.some((r) => r.conversationId === request.childConversationId) || (registeredIds.has(request.childConversationId) && !forkChildHeldBySameParent(request.childConversationId, request.parentConversationId))) return forkReply(res, 409, { ok: false, code: "CHILD_CONFLICT", error: "child conversation already registered" });
             let snapshot: ReturnType<typeof forkSnapshot>;
-            try { snapshot = forkSnapshot(parent); }
+            let source: CoreMessage[];
+            const recovered = parent.pluginSnapshot === undefined;
+            try { source = forkSourceMessages(parent); snapshot = forkSnapshot(parent, source); }
             catch (err) { return forkReply(res, 409, { ok: false, status: "unavailable", code: "SNAPSHOT_UNAVAILABLE", error: String(err) }); }
             if (snapshot.parentRevision !== request.parentRevision) {
                 // #2671 Phase 2b: accept a stale v1 revision (whole-store hash) from
@@ -1506,7 +1516,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             child.state.stats.tokensCompressed = child.state.blocks.filter((b) => b.active).reduce((sum, b) => sum + b.compressedTokens, 0);
             child.state.stats.compressionCount = blocks.length;
             if (prefix.length === snapshot.orderedMessages.length) child.state.nudge = structuredClone(parent.state.nudge);
-            child.pluginSnapshot = structuredClone(parent.pluginSnapshot!.slice(0, request.branchPoint.messageCount));
+            child.pluginSnapshot = structuredClone(source.slice(0, request.branchPoint.messageCount));
             const forkView = prune(child.pluginSnapshot, child.state);
             // Hiding the original pair is safe only if its summary survives the fork.
             child.state.absorbed = structuredClone(parent.state.absorbed?.filter((a) =>
@@ -1573,6 +1583,7 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             // lazily-persisted parent would drop its snapshot on disk and the next
             // restart would 409. Flush eagerly (publishForkSession precedent) so
             // the flag and the snapshot land in one write.
+            if (recovered) parent.pluginSnapshot = structuredClone(source);
             parent.metadata.publicSnapshotRetained = true;
             if (!getStore().flushSync(parent)) loggerLog("warn", `fork ${request.childConversationId}: parent snapshot flush failed (${parent.id}); the debounced save will retry`);
             forkReply(res, 201, response);

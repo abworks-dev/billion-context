@@ -115,7 +115,9 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
+    let storeClosed = false;
+    const closeStore = () => { if (!storeClosed) { storeClosed = true; store.closeQuietly(); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, closeStore, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "plugin-fork harness"); closeStore(); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
@@ -172,7 +174,7 @@ test("HTTP fork preserves sparse parent ledger before the child's first save", {
             assert.equal(bounds.end_seq, 3);
         } finally { verify.db.close(); }
     } finally {
-        h.store.closeQuietly();
+        h.closeStore();
         await h.close();
         if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED;
         else process.env.BILI_STORAGE_UNIFIED = oldMode;
@@ -199,7 +201,7 @@ for (const mode of ["full", "shadow"] as const) {
             failingWrite.mock.restore();
             assert.equal((await h.store.findSessionFiles("crash-child")).length, 0);
             h.store.cancelAll();
-            h.store.closeQuietly();
+            h.closeStore();
             _resetSessionsForTest();
             _resetPluginStateForTest();
             recovered = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
@@ -240,7 +242,7 @@ test("HTTP fork keeps unified-only JSON writer posture across replay", { timeout
     } finally {
         h.store.cancelAll();
         await h.close();
-        h.store.closeQuietly();
+        h.closeStore();
         if (before.mode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = before.mode;
         if (before.writer === undefined) delete process.env.BILI_STORAGE_JSON_WRITER; else process.env.BILI_STORAGE_JSON_WRITER = before.writer;
     }
@@ -266,7 +268,7 @@ test("HTTP fork transaction failure never publishes and same request can retry",
     } finally {
         h.store.cancelAll();
         await h.close();
-        h.store.closeQuietly();
+        h.closeStore();
         if (oldMode === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = oldMode;
     }
 });
@@ -861,7 +863,7 @@ for (const corruption of ["missing-ref", "missing-payload", "orphan-payload", "w
             // but because nothing was lost. Deleting the sidecar (after
             // closeQuietly — Windows cannot unlink an open index.db) makes the
             // 409 contract hold identically in full and legacy modes.
-            h.store.closeQuietly();
+            h.closeStore();
             const sidecar = join(h.dir, "sessions", "index.db");
             for (const f of [sidecar, `${sidecar}-wal`, `${sidecar}-shm`]) rmSync(f, { force: true });
             _resetSessionsForTest();
@@ -1458,7 +1460,9 @@ test("HTTP a mid-history rewrite replaces the snapshot wholesale with an exact b
     } finally { await h.close(); }
 });
 
-test("HTTP a lazily-persisted snapshot self-heals on the next model request after restart", { timeout: 60_000 }, async () => {
+test("HTTP a legacy-only lazily-persisted snapshot self-heals on the next model request after restart", { timeout: 60_000 }, async () => {
+    const previous = process.env.BILI_STORAGE_UNIFIED;
+    process.env.BILI_STORAGE_UNIFIED = "legacy";
     const h = await harness(true);
     try {
         const parent = resolveConversation("parent").session!;
@@ -1472,8 +1476,157 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
-    } finally { await h.close(); }
+    } finally {
+        await h.close();
+        if (previous === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = previous;
+    }
 });
+
+for (const mode of ["full", "shadow"] as const) {
+    test(`HTTP cold raw-tail fork inherits exact saved blocks without a new parent turn (${mode})`, { timeout: 60_000 }, async () => {
+        const previous = process.env.BILI_STORAGE_UNIFIED;
+        const previousCap = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+        process.env.BILI_STORAGE_UNIFIED = mode;
+        const h = await harness(true, false);
+        let reopened: SessionStore | undefined;
+        try {
+            h.messages[0]!.content = "汉字😀".repeat(250);
+            await sendModel(h, "parent", h.messages);
+            await compress(h);
+            const parent = resolveConversation("parent").session!;
+            const expected = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
+            const raw = structuredClone(parent.pluginSnapshot!);
+            assert.equal(parent.state.blocks.length, 1);
+            assert.equal(parent.metadata.publicSnapshotRetained, undefined);
+            assert(h.store.flushSync(parent));
+            h.store.cancelAll();
+            h.closeStore();
+            _resetSessionsForTest();
+            _resetPluginStateForTest();
+            reopened = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+            _setStoreForTest(reopened);
+            const serialized = stableJson(raw);
+            const bytes = Buffer.byteLength(serialized, "utf8");
+            assert(bytes > serialized.length + 1);
+            process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = String(bytes + 1);
+            const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+            assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+            assert.deepEqual(snapshot.body.orderedMessages, expected.orderedMessages);
+            const restored = getSession("parent");
+            assert.equal(restored.pluginSnapshot, undefined, "GET must not make a retained contract");
+            assert.equal(restored.metadata.publicSnapshotRetained, undefined);
+            assert.equal(reopened.loadSync(parent.id)!.pluginSnapshot, undefined, "GET must not retain a raw copy on disk");
+            if (mode === "shadow") assert.equal(restored.lastMessagesFolded, true, "the legacy envelope is folded, not a raw source");
+            process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = String(serialized.length + 1);
+            assert.equal(restored.metadata.publicSnapshotCapped, undefined, "the cap was lowered after the last model turn");
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409, "cold recovery measures UTF-8 bytes, not UTF-16 length");
+            process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = String(bytes + 1);
+            const rejected = await h.request("/__bili/plugin/fork", { ...forkRequest(snapshot.body, "rejected-child", 3), parentRevision: "0".repeat(64) });
+            assert.equal(rejected.status, 409);
+            assert.equal(rejected.body.code, "PARENT_REVISION_CONFLICT");
+            assert.equal(restored.pluginSnapshot, undefined, "a rejected POST must not retain the recovered source");
+            assert.equal(restored.metadata.publicSnapshotRetained, undefined);
+            assert.equal(resolveConversation("rejected-child").session, undefined);
+            const request = { ...forkRequest(snapshot.body, "cold-child", 3), parentRevision: forkParentRevisionLegacy(restored) };
+            const fork = await h.request("/__bili/plugin/fork", request);
+            assert.equal(fork.status, 201, JSON.stringify(fork.body));
+            assert.equal(fork.body.inheritedBlocks.length, 1);
+            const child = getSession("cold-child");
+            assert.deepEqual(child.pluginSnapshot, raw);
+            assert.deepEqual(child.state.blocks, restored.state.blocks);
+            assert.deepEqual(restored.pluginSnapshot, raw, "only a successful fork retains the recovered source");
+            assert.equal(restored.metadata.publicSnapshotRetained, true);
+            assert.deepEqual(reopened.loadSync(parent.id)!.pluginSnapshot, raw);
+            assert.equal(publicForkInputCheck(child, "anthropic", { messages: h.messages }).ok, true);
+            assert.equal(publicForkInputCheck(child, "anthropic", { messages: [...h.messages].reverse() }).ok, false);
+            const before = structuredClone(child.pluginSnapshot);
+            assert.equal((await h.request("/__bili/plugin/fork", request)).status, 200);
+            const conflict = await h.request("/__bili/plugin/fork", { ...request, idempotencyKey: "different" });
+            assert.equal(conflict.status, 409);
+            assert.equal(conflict.body.code, "CHILD_CONFLICT");
+            assert.deepEqual(child.pluginSnapshot, before);
+            const empty = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "empty-child", 0));
+            assert.equal(empty.status, 201, JSON.stringify(empty.body));
+            assert.deepEqual(getSession("empty-child").pluginSnapshot, []);
+            assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=empty-child")).status, 200);
+        } finally {
+            reopened?.cancelAll();
+            reopened?.closeQuietly();
+            await h.close();
+            if (previous === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = previous;
+            if (previousCap === undefined) delete process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES; else process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = previousCap;
+        }
+    });
+}
+
+for (const failure of ["folded", "partial", "reordered", "gap", "ref", "state-generation", "block-generation", "ccr-generation", "both-lost-ccr", "cap-flag", "cap-lowered", "opaque", "missing-order"] as const) {
+    test(`HTTP cold raw-tail recovery refuses ${failure} without guessing`, { timeout: 60_000 }, async () => {
+        const previous = process.env.BILI_STORAGE_UNIFIED;
+        const previousCap = process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES;
+        process.env.BILI_STORAGE_UNIFIED = "shadow";
+        const h = await harness(true);
+        let reopened: SessionStore | undefined;
+        try {
+            await compress(h);
+            const parent = resolveConversation("parent").session!;
+            parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0]!.id, text: "same generation CCR payload", kind: "original", tokens: 8, head: "same generation" });
+            parent.contentStoreDirty = true;
+            assert(h.store.flushSync(parent));
+            h.store.cancelAll();
+            h.closeStore();
+            _resetSessionsForTest();
+            _resetPluginStateForTest();
+            reopened = new SessionStore({ dir: join(h.dir, "sessions"), enabled: true, debounceMs: 60_000 });
+            _setStoreForTest(reopened);
+            const intact = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+            assert.equal(intact.status, 200, JSON.stringify(intact.body));
+            const restored = getSession("parent");
+            assert.equal(restored.lastMessagesFolded, true);
+            assert.equal(restored.pluginSnapshot, undefined);
+            if (["folded", "partial", "reordered", "gap"].includes(failure)) {
+                const db = openSqliteDatabase(join(h.dir, "sessions", "index.db"), "node:sqlite");
+                try {
+                    const row = db.db.prepare("SELECT tail_json FROM sessions WHERE session_id = ?").get(parent.id) as { tail_json: string };
+                    const tail = JSON.parse(row.tail_json) as { tailSeqs: number[]; tailFolded: boolean };
+                    if (failure === "folded") tail.tailFolded = true;
+                    if (failure === "partial") tail.tailSeqs = tail.tailSeqs.slice(1);
+                    if (failure === "reordered") tail.tailSeqs.reverse();
+                    if (failure === "gap") db.db.prepare("DELETE FROM messages WHERE session_id = ? AND seq = ?").run(parent.id, tail.tailSeqs[0]);
+                    db.db.prepare("UPDATE sessions SET tail_json = ? WHERE session_id = ?").run(JSON.stringify(tail), parent.id);
+                } finally { db.db.close(); }
+            } else if (failure === "ref") restored.state.messageRefs.byRef.m00001 = "wrong-raw-id";
+            else if (failure === "state-generation") restored.state.nextBlockId += 1;
+            else if (failure === "block-generation") restored.blockContents.clear();
+            else if (failure === "ccr-generation") restored.contentStore = createContentStore();
+            else if (failure === "both-lost-ccr") {
+                restored.contentStore = createContentStore();
+                const db = openSqliteDatabase(join(h.dir, "sessions", "index.db"), "node:sqlite");
+                try { db.db.prepare("UPDATE sessions SET ccr_json = NULL WHERE session_id = ?").run(parent.id); }
+                finally { db.db.close(); }
+                assert.deepEqual(restored.metadata.publicSnapshotStoredRefs, ["m00001"]);
+            }
+            else if (failure === "cap-flag") restored.metadata.publicSnapshotCapped = true;
+            else if (failure === "cap-lowered") process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = "1";
+            else if (failure === "opaque") restored.metadata.publicSnapshotTextComparable = false;
+            else if (failure === "missing-order") delete restored.state.lastPassIds;
+            const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+            assert.equal(snapshot.status, 409, JSON.stringify(snapshot.body));
+            assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
+            const fork = await h.request("/__bili/plugin/fork", forkRequest(intact.body, "unsafe-child", 3));
+            assert.equal(fork.status, 409, JSON.stringify(fork.body));
+            assert.equal(fork.body.code, "SNAPSHOT_UNAVAILABLE");
+            assert.equal(resolveConversation("unsafe-child").session, undefined);
+            assert.equal(restored.pluginSnapshot, undefined);
+            assert.equal(restored.metadata.publicSnapshotRetained, undefined);
+        } finally {
+            reopened?.cancelAll();
+            reopened?.closeQuietly();
+            await h.close();
+            if (previous === undefined) delete process.env.BILI_STORAGE_UNIFIED; else process.env.BILI_STORAGE_UNIFIED = previous;
+            if (previousCap === undefined) delete process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES; else process.env.BILI_PUBLIC_SNAPSHOT_CAP_BYTES = previousCap;
+        }
+    });
+}
 
 test("fork protocol v2: snapshot serves the light revision, a stale v1 whole-store revision is still accepted (#2671 Phase 2b)", { timeout: 60_000 }, async () => {
     const h = await harness();

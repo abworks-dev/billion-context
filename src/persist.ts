@@ -2,6 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { readdir, readFile, rm } from "node:fs/promises";
 import * as path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 const { join } = path;
 import { StateStore, flatFileNameFor, type PersistedEnvelope, type StateStoreCodec } from "acp-kernel/persist";
 import type { BiliMessage } from "acp-kernel/wire";
@@ -1670,6 +1671,26 @@ export class SessionStore {
     /** Unified-first view load (full mode). Null on miss. */
     private loadUnified(id: string): LegacySessionLike | null {
         return this.shadow ? this.shadow.viewFor(id) : null;
+    }
+
+    /** #5140: recover only the logical raw tail from the same state/CCR generation. */
+    forkRawTail(session: Session): CoreMessage[] | null {
+        if (!this.enabled) return null;
+        const view = this.loadUnified(session.id);
+        if (!view || view.lastMessagesFolded === true || (view as LegacySessionLike & { tailGaps?: number }).tailGaps !== 0) return null;
+        const messages = view.lastMessages;
+        const ids = session.state.lastPassIds;
+        if (!messages || !ids || ids.length === 0 || messages.length !== ids.length || messages.some((m, i) => m.id !== ids[i])) return null;
+        const storedState = mergeState(view.state as unknown as Parameters<typeof mergeState>[0]);
+        const liveState = { ...session.state };
+        // Cold-load alignment may stamp this flag without changing any mapping.
+        delete storedState.refLedgerAligned;
+        delete liveState.refLedgerAligned;
+        if (!isDeepStrictEqual(storedState, liveState) || !isDeepStrictEqual(Object.fromEntries(view.blockContents), Object.fromEntries(session.blockContents))) return null;
+        const emptyStore = { version: 1, byHash: {}, byRef: {} };
+        const liveStore = session.contentStore ?? this.unifiedCcrFor(session.id) ?? this.loadContentStore(session) ?? emptyStore;
+        if (!isDeepStrictEqual(view.contentStore ?? emptyStore, liveStore)) return null;
+        return messages;
     }
 
     /** Read-only state load for cross-session search (#841): unlike loadSync,
